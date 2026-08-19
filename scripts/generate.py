@@ -174,22 +174,42 @@ def resolve_models(api_key):
         and "preview" not in m["name"].lower()
         and "exp" not in m["name"].lower()
         and "latest" not in m["name"].lower()  # алиасы вида gemini-flash-latest нестабильны/перегружены
+        and "image" not in m["name"].lower()   # это модели генерации картинок, не текста
     ]
-    flash_any = [
+    flash_lite_stable = [
         m["name"] for m in models
-        if supports_generate(m) and "flash" in m["name"].lower() and "latest" not in m["name"].lower()
+        if supports_generate(m)
+        and "flash" in m["name"].lower()
+        and "lite" in m["name"].lower()
+        and "preview" not in m["name"].lower()
+        and "exp" not in m["name"].lower()
+        and "latest" not in m["name"].lower()
+        and "image" not in m["name"].lower()
     ]
-    any_model = [
+    everything_else = [
         m["name"] for m in models
-        if supports_generate(m) and "latest" not in m["name"].lower()
+        if supports_generate(m) and "latest" not in m["name"].lower() and "image" not in m["name"].lower()
     ]
 
-    candidates = flash_stable or flash_any or any_model
+    # Приоритет: свежие обычные flash-модели → lite-версии (менее качественные,
+    # но обычно менее нагруженные) → всё остальное как крайний случай.
+    # Это даёт реальный fallback, если топовая модель временно перегружена,
+    # а не просто одну попытку с одним именем модели.
+    flash_stable.sort(reverse=True)
+    flash_lite_stable.sort(reverse=True)
+    everything_else.sort(reverse=True)
+
+    seen = set()
+    candidates = []
+    for name in flash_stable + flash_lite_stable + everything_else:
+        if name not in seen:
+            seen.add(name)
+            candidates.append(name)
+
     if not candidates:
         raise RuntimeError("Gemini API не вернул ни одной модели с поддержкой generateContent")
 
-    candidates.sort(reverse=True)  # имена вида models/gemini-3.7-flash — новые версии идут первыми
-    print(f"[..] доступные модели (по приоритету): {', '.join(candidates[:4])}{' ...' if len(candidates) > 4 else ''}")
+    print(f"[..] доступные модели (по приоритету): {', '.join(candidates[:5])}{' ...' if len(candidates) > 5 else ''}")
     return candidates
 
 
@@ -219,7 +239,7 @@ def generate_article(api_key, model_candidates, topic):
     # временно перегружена (частое дело в первые дни после релиза), едем
     # на следующей по списку вместо того, чтобы просто упасть.
     for model_name in model_candidates:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = requests.post(
                     GEMINI_GENERATE_URL_TMPL.format(model=model_name),
@@ -228,32 +248,44 @@ def generate_article(api_key, model_candidates, topic):
                         "contents": [{"parts": [{"text": prompt}]}],
                         "generationConfig": {
                             "temperature": 0.9,
-                            "maxOutputTokens": 4096,
+                            "maxOutputTokens": 8192,
                             "responseMimeType": "application/json",
                         },
                     },
-                    timeout=60,
+                    timeout=90,
                 )
             except requests.RequestException as e:
                 last_error = e
                 print(f"[warn] сетевая ошибка при обращении к {model_name}: {e}", file=sys.stderr)
-                time.sleep(5)
+                time.sleep(4)
                 continue
 
             if resp.status_code == 503:
-                print(f"[warn] {model_name} временно перегружен (503), попытка {attempt + 1}/3", file=sys.stderr)
+                print(f"[warn] {model_name} временно перегружен (503), попытка {attempt + 1}/2", file=sys.stderr)
                 last_error = resp
-                time.sleep(8)
+                time.sleep(5)
                 continue
 
-            resp.raise_for_status()
-            payload = resp.json()
-            raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw = re.sub(r"^```(?:json)?", "", raw).strip()
-            raw = re.sub(r"```$", "", raw).strip()
-            return json.loads(raw)
+            # Всё, что может пойти не так при разборе УЖЕ ПОЛУЧЕННОГО ответа
+            # (пустое тело, обрезанный по safety-фильтру ответ, невалидный
+            # JSON от модели) — тоже повод повторить попытку, а не уронить
+            # всю функцию целиком.
+            try:
+                resp.raise_for_status()
+                payload = resp.json()
+                raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
+                raw = re.sub(r"^```(?:json)?", "", raw).strip()
+                raw = re.sub(r"```$", "", raw).strip()
+                if not raw:
+                    raise ValueError("пустой текст в ответе модели")
+                return json.loads(raw)
+            except (requests.RequestException, KeyError, IndexError, ValueError) as e:
+                last_error = e
+                print(f"[warn] некорректный ответ от {model_name} (попытка {attempt + 1}/2): {e}", file=sys.stderr)
+                time.sleep(3)
+                continue
 
-        print(f"[warn] модель {model_name} недоступна после 3 попыток, пробую следующую", file=sys.stderr)
+        print(f"[warn] модель {model_name} недоступна, пробую следующую", file=sys.stderr)
 
     if isinstance(last_error, requests.Response):
         last_error.raise_for_status()
