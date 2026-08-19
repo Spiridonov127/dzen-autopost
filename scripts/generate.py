@@ -42,7 +42,7 @@ import requests
 # Имя конкретной модели не хардкодим — Google переименовывает/деприкейтит
 # модели каждые несколько месяцев (gemini-2.5-flash уже недоступен новым
 # ключам на момент написания). Вместо этого запрашиваем список доступных
-# моделей и берём самую свежую подходящую flash-модель — см. resolve_model().
+# моделей и берём список подходящих flash-моделей от новых к старым — см. resolve_models().
 GEMINI_LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
 
@@ -155,7 +155,7 @@ def pick_topic(used_titles):
 # Генерация текста через Claude
 # ---------------------------------------------------------------------------
 
-def resolve_model(api_key):
+def resolve_models(api_key):
     """Спрашивает у Gemini API список доступных моделей и выбирает подходящую
     flash-модель с поддержкой generateContent. Так скрипт переживёт очередное
     переименование моделей Google без правки кода."""
@@ -188,13 +188,12 @@ def resolve_model(api_key):
     if not candidates:
         raise RuntimeError("Gemini API не вернул ни одной модели с поддержкой generateContent")
 
-    candidates.sort()  # имена вида models/gemini-3.7-flash — лексикографически новее версии оказываются последними
-    chosen = candidates[-1]
-    print(f"[..] выбрана модель Gemini: {chosen}")
-    return chosen
+    candidates.sort(reverse=True)  # имена вида models/gemini-3.7-flash — новые версии идут первыми
+    print(f"[..] доступные модели (по приоритету): {', '.join(candidates[:4])}{' ...' if len(candidates) > 4 else ''}")
+    return candidates
 
 
-def generate_article(api_key, model_name, topic):
+def generate_article(api_key, model_candidates, topic):
     prompt = f"""Ты — редактор популярного канала интересных фактов в Яндекс.Дзен.
 
 Напиши статью на тему: "{topic}".
@@ -216,33 +215,49 @@ def generate_article(api_key, model_name, topic):
 }}"""
 
     last_error = None
-    for attempt in range(3):
-        resp = requests.post(
-            GEMINI_GENERATE_URL_TMPL.format(model=model_name),
-            params={"key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.9,
-                    "maxOutputTokens": 4096,
-                    "responseMimeType": "application/json",
-                },
-            },
-            timeout=60,
-        )
-        if resp.status_code == 503 and attempt < 2:
-            print(f"[warn] Gemini временно перегружен (503), повтор через 5 сек ({attempt + 1}/3)", file=sys.stderr)
-            time.sleep(5)
-            last_error = resp
-            continue
-        resp.raise_for_status()
-        payload = resp.json()
-        raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
-        return json.loads(raw)
+    # Перебираем модели от самой новой к более старым: если топовая модель
+    # временно перегружена (частое дело в первые дни после релиза), едем
+    # на следующей по списку вместо того, чтобы просто упасть.
+    for model_name in model_candidates:
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    GEMINI_GENERATE_URL_TMPL.format(model=model_name),
+                    params={"key": api_key},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.9,
+                            "maxOutputTokens": 4096,
+                            "responseMimeType": "application/json",
+                        },
+                    },
+                    timeout=60,
+                )
+            except requests.RequestException as e:
+                last_error = e
+                print(f"[warn] сетевая ошибка при обращении к {model_name}: {e}", file=sys.stderr)
+                time.sleep(5)
+                continue
 
-    last_error.raise_for_status()
+            if resp.status_code == 503:
+                print(f"[warn] {model_name} временно перегружен (503), попытка {attempt + 1}/3", file=sys.stderr)
+                last_error = resp
+                time.sleep(8)
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
+            raw = re.sub(r"^```(?:json)?", "", raw).strip()
+            raw = re.sub(r"```$", "", raw).strip()
+            return json.loads(raw)
+
+        print(f"[warn] модель {model_name} недоступна после 3 попыток, пробую следующую", file=sys.stderr)
+
+    if isinstance(last_error, requests.Response):
+        last_error.raise_for_status()
+    raise RuntimeError(f"Ни одна из моделей Gemini не ответила: {last_error}")
 
 
 def notify_telegram(text):
@@ -442,7 +457,7 @@ def main():
     used_titles = [a["title"] for a in registry]
 
     try:
-        model_name = resolve_model(gemini_key)
+        model_candidates = resolve_models(gemini_key)
     except Exception as e:
         sys.exit(f"Ошибка: не удалось определить доступную модель Gemini: {e}")
 
@@ -452,7 +467,7 @@ def main():
         topic = pick_topic(used_titles)
         print(f"[..] генерирую статью по теме: {topic}")
         try:
-            data = generate_article(gemini_key, model_name, topic)
+            data = generate_article(gemini_key, model_candidates, topic)
         except Exception as e:
             print(f"[error] генерация не удалась: {e}", file=sys.stderr)
             continue
