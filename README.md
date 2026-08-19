@@ -21,9 +21,11 @@
    из ветки `main`, папка `/docs`.
 4. Ваш сайт будет доступен по адресу `https://ВАШ_ЛОГИН.github.io/ИМЯ_РЕПО/`.
 
-## Шаг 2. Получите ключи API
+## Шаг 2. Получите ключи API (оба бесплатные, без карты)
 
-- **Anthropic API key** — https://console.anthropic.com (раздел API Keys).
+- **Gemini API key** — https://aistudio.google.com/apikey. Войдите под Google-
+  аккаунтом, нажмите "Create API key". Бесплатный тариф Gemini 2.5 Flash
+  спокойно покрывает 6 статей в день — это далеко не предел лимита.
 - **Pexels API key** — https://www.pexels.com/api/ (бесплатно, лимит хватает
   с запасом на 6 статей × 4 фото в день).
 
@@ -32,10 +34,27 @@
 В репозитории: **Settings → Secrets and variables → Actions**
 
 - Вкладка **Secrets**, кнопка New repository secret:
-  - `ANTHROPIC_API_KEY` — ваш ключ Anthropic
+  - `GEMINI_API_KEY` — ваш ключ Gemini
   - `PEXELS_API_KEY` — ваш ключ Pexels
+  - (опционально) `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` — см. раздел
+    "Уведомления в Telegram" ниже
 - Вкладка **Variables**, кнопка New repository variable:
   - `SITE_URL` = `https://ВАШ_ЛОГИН.github.io/ИМЯ_РЕПО`
+
+### Уведомления в Telegram (опционально)
+
+Сама публикация в Дзен идёт через RSS полностью автоматически — Telegram
+здесь не обязателен. Но можно настроить бота, который будет присылать
+сообщение "Опубликована новая партия статей" каждый раз, когда отработал
+воркфлоу — удобно для контроля, не заходя в GitHub.
+
+1. Напишите **@BotFather** в Telegram → `/newbot` → следуйте подсказкам →
+   получите токен вида `123456:ABC-DEF...`. Это `TELEGRAM_BOT_TOKEN`.
+2. Напишите своему новому боту любое сообщение (иначе он не сможет писать вам).
+3. Откройте в браузере
+   `https://api.telegram.org/bot<ВАШ_ТОКЕН>/getUpdates` и найдите в ответе
+   `"chat":{"id": ЧИСЛО, ...}` — это и есть `TELEGRAM_CHAT_ID`.
+4. Впишите оба значения в Secrets репозитория, как описано выше.
 
 ## Шаг 4. Наполните сайт перед подключением к Дзену
 
@@ -63,7 +82,7 @@
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-...
+export GEMINI_API_KEY=AIza...
 export PEXELS_API_KEY=...
 export SITE_URL=https://ВАШ_ЛОГИН.github.io/ИМЯ_РЕПО
 python scripts/generate.py --count 1
@@ -74,7 +93,9 @@ python scripts/generate.py --count 1
 ## Что можно донастроить
 
 - **Темы** — список `TOPIC_POOL` в `scripts/generate.py`. Замените под свою нишу.
-- **Модель** — по умолчанию `claude-sonnet-5`; можно сменить на другую доступную модель.
+- **Модель** — по умолчанию `gemini-2.5-flash` (переменная `GEMINI_MODEL` в
+  начале `scripts/generate.py`); при желании можно сменить на `gemini-2.5-pro`
+  (качественнее, но медленнее и с более жёстким лимитом бесплатного тарифа).
 - **Расписание** — в `.github/workflows/publish.yml`, время указано в UTC.
 - **Стиль статьи** — правьте промпт внутри функции `generate_article`.
 

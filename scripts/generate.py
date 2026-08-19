@@ -15,9 +15,11 @@
     python scripts/generate.py --count 3
 
 Переменные окружения (задаются как GitHub Secrets):
-    ANTHROPIC_API_KEY  — ключ Anthropic API
-    PEXELS_API_KEY     — ключ Pexels API (бесплатный, https://www.pexels.com/api/)
-    SITE_URL           — базовый URL сайта, напр. https://username.github.io/dzen-autopost
+    GEMINI_API_KEY      — ключ Google Gemini API (бесплатный, https://aistudio.google.com/apikey)
+    PEXELS_API_KEY      — ключ Pexels API (бесплатный, https://www.pexels.com/api/)
+    SITE_URL            — базовый URL сайта, напр. https://username.github.io/dzen-autopost
+    TELEGRAM_BOT_TOKEN  — опционально, для уведомлений о новых статьях
+    TELEGRAM_CHAT_ID    — опционально, для уведомлений о новых статьях
 """
 
 import os
@@ -30,13 +32,18 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import requests
-import anthropic
 
 # ---------------------------------------------------------------------------
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_MODEL = "claude-sonnet-5"
+# Бесплатная модель Google Gemini (не требует привязки карты).
+# Ключ берётся на https://aistudio.google.com/apikey
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Опционально: уведомления в Telegram о новой партии статей
+TELEGRAM_ENDPOINT = "https://api.telegram.org/bot{token}/sendMessage"
 
 SITE_URL = os.environ.get("SITE_URL", "https://example.github.io/dzen-autopost").rstrip("/")
 DOCS_DIR = os.path.join(os.path.dirname(__file__), "..", "docs")
@@ -144,7 +151,7 @@ def pick_topic(used_titles):
 # Генерация текста через Claude
 # ---------------------------------------------------------------------------
 
-def generate_article(client, topic):
+def generate_article(api_key, topic):
     prompt = f"""Ты — редактор популярного канала интересных фактов в Яндекс.Дзен.
 
 Напиши статью на тему: "{topic}".
@@ -165,16 +172,41 @@ def generate_article(client, topic):
   "html": "полный текст статьи в HTML по описанным выше правилам"
 }}"""
 
-    resp = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
+    resp = requests.post(
+        GEMINI_ENDPOINT,
+        params={"key": api_key},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.9,
+                "maxOutputTokens": 4096,
+                "responseMimeType": "application/json",
+            },
+        },
+        timeout=60,
     )
-    raw = resp.content[0].text.strip()
+    resp.raise_for_status()
+    payload = resp.json()
+    raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
     data = json.loads(raw)
     return data
+
+
+def notify_telegram(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            TELEGRAM_ENDPOINT.format(token=token),
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"[warn] не удалось отправить уведомление в Telegram: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -348,34 +380,39 @@ def main():
     parser.add_argument("--count", type=int, default=3, help="сколько статей сгенерировать за запуск")
     args = parser.parse_args()
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
     pexels_key = os.environ.get("PEXELS_API_KEY")
-    if not anthropic_key:
-        sys.exit("Ошибка: не задана переменная окружения ANTHROPIC_API_KEY")
+    if not gemini_key:
+        sys.exit("Ошибка: не задана переменная окружения GEMINI_API_KEY")
     if not pexels_key:
         sys.exit("Ошибка: не задана переменная окружения PEXELS_API_KEY")
 
-    client = anthropic.Anthropic(api_key=anthropic_key)
     registry = load_registry()
     used_titles = [a["title"] for a in registry]
 
     now = datetime.now(timezone.utc)
+    published = []
     for i in range(args.count):
         topic = pick_topic(used_titles)
         print(f"[..] генерирую статью по теме: {topic}")
         try:
-            data = generate_article(client, topic)
+            data = generate_article(gemini_key, topic)
         except Exception as e:
             print(f"[error] генерация не удалась: {e}", file=sys.stderr)
             continue
 
         images = fetch_images(data.get("image_queries", []), pexels_key)
         pub_dt = now + timedelta(minutes=i * 2)
-        save_article(data, images, pub_dt)
+        entry = save_article(data, images, pub_dt)
+        published.append(entry)
         used_titles.append(data["title"])
         time.sleep(2)  # не долбить API слишком часто
 
     build_feed()
+
+    if published:
+        lines = "\n".join(f"• {a['title']}\n{a['url']}" for a in published)
+        notify_telegram(f"Опубликована новая партия статей ({len(published)}):\n\n{lines}")
 
 
 if __name__ == "__main__":
