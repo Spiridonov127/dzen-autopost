@@ -173,12 +173,16 @@ def resolve_model(api_key):
         and "lite" not in m["name"].lower()
         and "preview" not in m["name"].lower()
         and "exp" not in m["name"].lower()
+        and "latest" not in m["name"].lower()  # алиасы вида gemini-flash-latest нестабильны/перегружены
     ]
     flash_any = [
         m["name"] for m in models
-        if supports_generate(m) and "flash" in m["name"].lower()
+        if supports_generate(m) and "flash" in m["name"].lower() and "latest" not in m["name"].lower()
     ]
-    any_model = [m["name"] for m in models if supports_generate(m)]
+    any_model = [
+        m["name"] for m in models
+        if supports_generate(m) and "latest" not in m["name"].lower()
+    ]
 
     candidates = flash_stable or flash_any or any_model
     if not candidates:
@@ -211,26 +215,34 @@ def generate_article(api_key, model_name, topic):
   "html": "полный текст статьи в HTML по описанным выше правилам"
 }}"""
 
-    resp = requests.post(
-        GEMINI_GENERATE_URL_TMPL.format(model=model_name),
-        params={"key": api_key},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.9,
-                "maxOutputTokens": 4096,
-                "responseMimeType": "application/json",
+    last_error = None
+    for attempt in range(3):
+        resp = requests.post(
+            GEMINI_GENERATE_URL_TMPL.format(model=model_name),
+            params={"key": api_key},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.9,
+                    "maxOutputTokens": 4096,
+                    "responseMimeType": "application/json",
+                },
             },
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw = re.sub(r"^```(?:json)?", "", raw).strip()
-    raw = re.sub(r"```$", "", raw).strip()
-    data = json.loads(raw)
-    return data
+            timeout=60,
+        )
+        if resp.status_code == 503 and attempt < 2:
+            print(f"[warn] Gemini временно перегружен (503), повтор через 5 сек ({attempt + 1}/3)", file=sys.stderr)
+            time.sleep(5)
+            last_error = resp
+            continue
+        resp.raise_for_status()
+        payload = resp.json()
+        raw = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw = re.sub(r"^```(?:json)?", "", raw).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+        return json.loads(raw)
+
+    last_error.raise_for_status()
 
 
 def notify_telegram(text):
