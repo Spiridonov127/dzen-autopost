@@ -39,8 +39,12 @@ import requests
 
 # Бесплатная модель Google Gemini (не требует привязки карты).
 # Ключ берётся на https://aistudio.google.com/apikey
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Имя конкретной модели не хардкодим — Google переименовывает/деприкейтит
+# модели каждые несколько месяцев (gemini-2.5-flash уже недоступен новым
+# ключам на момент написания). Вместо этого запрашиваем список доступных
+# моделей и берём самую свежую подходящую flash-модель — см. resolve_model().
+GEMINI_LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
 
 # Опционально: уведомления в Telegram о новой партии статей
 TELEGRAM_ENDPOINT = "https://api.telegram.org/bot{token}/sendMessage"
@@ -151,7 +155,42 @@ def pick_topic(used_titles):
 # Генерация текста через Claude
 # ---------------------------------------------------------------------------
 
-def generate_article(api_key, topic):
+def resolve_model(api_key):
+    """Спрашивает у Gemini API список доступных моделей и выбирает подходящую
+    flash-модель с поддержкой generateContent. Так скрипт переживёт очередное
+    переименование моделей Google без правки кода."""
+    r = requests.get(GEMINI_LIST_MODELS_URL, params={"key": api_key}, timeout=30)
+    r.raise_for_status()
+    models = r.json().get("models", [])
+
+    def supports_generate(m):
+        return "generateContent" in m.get("supportedGenerationMethods", [])
+
+    flash_stable = [
+        m["name"] for m in models
+        if supports_generate(m)
+        and "flash" in m["name"].lower()
+        and "lite" not in m["name"].lower()
+        and "preview" not in m["name"].lower()
+        and "exp" not in m["name"].lower()
+    ]
+    flash_any = [
+        m["name"] for m in models
+        if supports_generate(m) and "flash" in m["name"].lower()
+    ]
+    any_model = [m["name"] for m in models if supports_generate(m)]
+
+    candidates = flash_stable or flash_any or any_model
+    if not candidates:
+        raise RuntimeError("Gemini API не вернул ни одной модели с поддержкой generateContent")
+
+    candidates.sort()  # имена вида models/gemini-3.7-flash — лексикографически новее версии оказываются последними
+    chosen = candidates[-1]
+    print(f"[..] выбрана модель Gemini: {chosen}")
+    return chosen
+
+
+def generate_article(api_key, model_name, topic):
     prompt = f"""Ты — редактор популярного канала интересных фактов в Яндекс.Дзен.
 
 Напиши статью на тему: "{topic}".
@@ -173,7 +212,7 @@ def generate_article(api_key, topic):
 }}"""
 
     resp = requests.post(
-        GEMINI_ENDPOINT,
+        GEMINI_GENERATE_URL_TMPL.format(model=model_name),
         params={"key": api_key},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
@@ -390,13 +429,18 @@ def main():
     registry = load_registry()
     used_titles = [a["title"] for a in registry]
 
+    try:
+        model_name = resolve_model(gemini_key)
+    except Exception as e:
+        sys.exit(f"Ошибка: не удалось определить доступную модель Gemini: {e}")
+
     now = datetime.now(timezone.utc)
     published = []
     for i in range(args.count):
         topic = pick_topic(used_titles)
         print(f"[..] генерирую статью по теме: {topic}")
         try:
-            data = generate_article(gemini_key, topic)
+            data = generate_article(gemini_key, model_name, topic)
         except Exception as e:
             print(f"[error] генерация не удалась: {e}", file=sys.stderr)
             continue
